@@ -1,0 +1,690 @@
+name: build-musicplayer
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14'
+
+      - name: Resolve versions
+        run: |
+          set -e
+          LOADER=$(curl -fsSL https://meta.fabricmc.net/v2/versions/loader | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)
+          FAPI=$(curl -fsSL https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml | grep -o '<version>[^<]*+1.21.11</version>' | tail -1 | sed 's/<[^>]*>//g')
+          LOOM=$(curl -fsSL https://maven.fabricmc.net/net/fabricmc/fabric-loom/maven-metadata.xml | grep -o '<release>[^<]*</release>' | sed 's/<[^>]*>//g')
+          if [ -z "$FAPI" ]; then echo "Fabric API untuk 1.21.11 tidak ketemu"; exit 1; fi
+          echo "LOADER=$LOADER" >> "$GITHUB_ENV"
+          echo "FAPI=$FAPI" >> "$GITHUB_ENV"
+          echo "LOOM=$LOOM" >> "$GITHUB_ENV"
+          echo "loader=$LOADER fabric-api=$FAPI loom=$LOOM"
+
+      - name: Generate mod project
+        run: |
+          mkdir -p src/main/java/com/kita/musicplayer src/main/resources
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = 'Fabric'
+                      url = 'https://maven.fabricmc.net/'
+                  }
+                  gradlePluginPortal()
+              }
+          }
+
+          rootProject.name = 'musicplayer'
+          EOF
+
+          cat > gradle.properties <<EOF
+          org.gradle.jvmargs=-Xmx2G
+          minecraft_version=1.21.11
+          loader_version=$LOADER
+          fabric_version=$FAPI
+          mod_version=1.0.0
+          maven_group=com.kita
+          archives_base_name=musicplayer
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'net.fabricmc.fabric-loom' version '__LOOM__'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+              maven {
+                  name = 'Fabric'
+                  url = 'https://maven.fabricmc.net/'
+              }
+              mavenCentral()
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings loom.officialMojangMappings()
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+              implementation 'com.googlecode.soundlibs:mp3spi:1.9.5.4'
+              include 'com.googlecode.soundlibs:mp3spi:1.9.5.4'
+              implementation 'com.googlecode.soundlibs:vorbisspi:1.0.3.3'
+              include 'com.googlecode.soundlibs:vorbisspi:1.0.3.3'
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              options.encoding = 'UTF-8'
+              options.release = 21
+          }
+
+          processResources {
+              inputs.property 'version', project.version
+              filesMatching('fabric.mod.json') {
+                  expand version: project.version
+              }
+          }
+          EOF
+          sed -i "s/__LOOM__/$LOOM/" build.gradle
+
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "musicplayer",
+            "version": "${version}",
+            "name": "Music Player",
+            "description": "Music player overlay (tekan M) untuk memutar mp3 dan ogg dari folder music.",
+            "authors": ["kita"],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.kita.musicplayer.MusicPlayerClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.16.0",
+              "minecraft": "~1.21.11",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+
+          cat > src/main/java/com/kita/musicplayer/MusicPlayerClient.java <<'EOF'
+          package com.kita.musicplayer;
+
+          import com.mojang.blaze3d.platform.InputConstants;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.minecraft.client.KeyMapping;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.resources.Identifier;
+          import org.lwjgl.glfw.GLFW;
+
+          public class MusicPlayerClient implements ClientModInitializer {
+              private static final KeyMapping.Category CATEGORY =
+                      KeyMapping.Category.register(Identifier.fromNamespaceAndPath("musicplayer", "main"));
+
+              private static final KeyMapping OPEN_KEY = KeyBindingHelper.registerKeyBinding(
+                      new KeyMapping("key.musicplayer.open", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_M, CATEGORY));
+
+              @Override
+              public void onInitializeClient() {
+                  MusicConfig.load();
+                  MusicManager.reload();
+
+                  ClientTickEvents.END_CLIENT_TICK.register(mc -> {
+                      while (OPEN_KEY.consumeClick()) {
+                          toggle(mc);
+                      }
+                  });
+              }
+
+              private static void toggle(Minecraft mc) {
+                  if (mc.screen instanceof MusicScreen screen) {
+                      screen.onClose();
+                  } else if (mc.screen == null) {
+                      mc.setScreen(new MusicScreen());
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/kita/musicplayer/MusicConfig.java <<'EOF'
+          package com.kita.musicplayer;
+
+          import com.mojang.logging.LogUtils;
+          import net.fabricmc.loader.api.FabricLoader;
+          import org.slf4j.Logger;
+
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.nio.file.Files;
+          import java.nio.file.InvalidPathException;
+          import java.nio.file.Path;
+          import java.util.Properties;
+
+          public final class MusicConfig {
+              private static final Logger LOGGER = LogUtils.getLogger();
+              private static final Path FILE = FabricLoader.getInstance().getConfigDir().resolve("musicplayer.properties");
+              private static String customDir = "";
+
+              private MusicConfig() {}
+
+              public static void load() {
+                  try {
+                      Files.createDirectories(defaultDir());
+                  } catch (IOException e) {
+                      LOGGER.warn("Gagal membuat folder music bawaan", e);
+                  }
+                  if (!Files.exists(FILE)) return;
+                  Properties props = new Properties();
+                  try (InputStream in = Files.newInputStream(FILE)) {
+                      props.load(in);
+                      customDir = props.getProperty("musicDir", "").trim();
+                  } catch (IOException e) {
+                      LOGGER.warn("Gagal membaca musicplayer.properties", e);
+                  }
+              }
+
+              public static void setCustomDir(String dir) {
+                  customDir = dir.trim();
+                  Properties props = new Properties();
+                  props.setProperty("musicDir", customDir);
+                  try {
+                      Files.createDirectories(FILE.getParent());
+                      try (OutputStream out = Files.newOutputStream(FILE)) {
+                          props.store(out, "Music Player config");
+                      }
+                  } catch (IOException e) {
+                      LOGGER.warn("Gagal menyimpan musicplayer.properties", e);
+                  }
+              }
+
+              public static String getCustomDir() {
+                  return customDir;
+              }
+
+              public static Path defaultDir() {
+                  return FabricLoader.getInstance().getGameDir().resolve("music");
+              }
+
+              public static Path activeDir() {
+                  if (customDir.isEmpty()) return defaultDir();
+                  try {
+                      return Path.of(customDir);
+                  } catch (InvalidPathException e) {
+                      return defaultDir();
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/kita/musicplayer/MusicManager.java <<'EOF'
+          package com.kita.musicplayer;
+
+          import com.mojang.logging.LogUtils;
+          import net.minecraft.client.Minecraft;
+          import org.slf4j.Logger;
+
+          import javax.sound.sampled.AudioFormat;
+          import javax.sound.sampled.AudioInputStream;
+          import javax.sound.sampled.AudioSystem;
+          import javax.sound.sampled.SourceDataLine;
+          import java.io.IOException;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Set;
+          import java.util.stream.Stream;
+
+          public final class MusicManager {
+              private static final Logger LOGGER = LogUtils.getLogger();
+              private static final Set<String> SUPPORTED = Set.of(".mp3", ".ogg");
+              private static final List<Path> TRACKS = new ArrayList<>();
+              private static volatile int index = -1;
+              private static volatile Session session;
+
+              private static final class Session {
+                  volatile boolean stop;
+                  volatile boolean paused;
+              }
+
+              private MusicManager() {}
+
+              public static synchronized void reload() {
+                  stop();
+                  TRACKS.clear();
+                  index = -1;
+                  Path dir = MusicConfig.activeDir();
+                  if (!Files.isDirectory(dir)) {
+                      LOGGER.warn("Folder musik tidak ditemukan: {}", dir);
+                      return;
+                  }
+                  Comparator<Path> byName = Comparator.comparing((Path p) -> p.getFileName().toString().toLowerCase(Locale.ROOT));
+                  try (Stream<Path> files = Files.list(dir)) {
+                      files.filter(Files::isRegularFile)
+                           .filter(p -> SUPPORTED.contains(extOf(p)))
+                           .sorted(byName)
+                           .forEach(TRACKS::add);
+                  } catch (IOException e) {
+                      LOGGER.warn("Gagal membaca folder musik", e);
+                  }
+                  LOGGER.info("Musik dimuat: {} lagu dari {}", TRACKS.size(), dir);
+              }
+
+              public static List<Path> tracks() {
+                  return Collections.unmodifiableList(TRACKS);
+              }
+
+              public static int currentIndex() {
+                  return index;
+              }
+
+              public static String nowPlaying() {
+                  int i = index;
+                  return (i >= 0 && i < TRACKS.size()) ? TRACKS.get(i).getFileName().toString() : "-";
+              }
+
+              public static boolean isPlaying() {
+                  Session s = session;
+                  return s != null && !s.stop;
+              }
+
+              public static boolean isPaused() {
+                  Session s = session;
+                  return s != null && !s.stop && s.paused;
+              }
+
+              public static synchronized void play(int i) {
+                  if (i < 0 || i >= TRACKS.size()) return;
+                  stop();
+                  index = i;
+                  Session s = new Session();
+                  session = s;
+                  Path file = TRACKS.get(i);
+                  Thread t = new Thread(() -> decode(file, s), "musicplayer-" + i);
+                  t.setDaemon(true);
+                  t.start();
+              }
+
+              public static synchronized void resumeOrPlay() {
+                  if (isPlaying()) {
+                      togglePause();
+                  } else {
+                      play(index < 0 ? 0 : index);
+                  }
+              }
+
+              public static void togglePause() {
+                  Session s = session;
+                  if (s != null && !s.stop) s.paused = !s.paused;
+              }
+
+              public static synchronized void stop() {
+                  Session s = session;
+                  if (s != null) {
+                      s.stop = true;
+                      session = null;
+                  }
+              }
+
+              public static synchronized void next() {
+                  if (TRACKS.isEmpty()) return;
+                  play(index < 0 ? 0 : (index + 1) % TRACKS.size());
+              }
+
+              public static synchronized void prev() {
+                  if (TRACKS.isEmpty()) return;
+                  play(index <= 0 ? TRACKS.size() - 1 : index - 1);
+              }
+
+              private static void decode(Path file, Session s) {
+                  try (AudioInputStream src = AudioSystem.getAudioInputStream(file.toFile())) {
+                      AudioFormat base = src.getFormat();
+                      AudioFormat pcm = new AudioFormat(
+                              AudioFormat.Encoding.PCM_SIGNED,
+                              base.getSampleRate(),
+                              16,
+                              base.getChannels(),
+                              base.getChannels() * 2,
+                              base.getSampleRate(),
+                              false);
+
+                      try (AudioInputStream decoded = AudioSystem.getAudioInputStream(pcm, src);
+                           SourceDataLine line = AudioSystem.getSourceDataLine(pcm)) {
+                          line.open(pcm);
+                          line.start();
+                          byte[] buf = new byte[4096];
+                          int n;
+                          while (!s.stop && (n = decoded.read(buf, 0, buf.length)) != -1) {
+                              while (s.paused && !s.stop) {
+                                  Thread.sleep(50);
+                              }
+                              line.write(buf, 0, n);
+                          }
+                          if (!s.stop) line.drain();
+                          line.stop();
+                      }
+                  } catch (Exception e) {
+                      LOGGER.warn("Gagal memutar {}", file, e);
+                  }
+
+                  // lagu habis secara normal -> lanjut ke berikutnya
+                  if (!s.stop) {
+                      Minecraft.getInstance().execute(() -> {
+                          if (session == s) next();
+                      });
+                  }
+              }
+
+              private static String extOf(Path p) {
+                  String n = p.getFileName().toString().toLowerCase(Locale.ROOT);
+                  int dot = n.lastIndexOf('.');
+                  return dot < 0 ? "" : n.substring(dot);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/kita/musicplayer/MusicScreen.java <<'EOF'
+          package com.kita.musicplayer;
+
+          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.components.EditBox;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.network.chat.Component;
+          import org.lwjgl.glfw.GLFW;
+
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.List;
+
+          public class MusicScreen extends Screen {
+              private static final int PANEL = 0x00060A07;
+              private static final int ACCENT = 0xFF33FF77;
+              private static final int ACCENT_RGB = 0x33FF77;
+              private static final int ACCENT_DIM = 0x9933FF77;
+              private static final int TEXT = 0xFFE6FFEE;
+              private static final int MUTED = 0xFF6F8F79;
+              private static final int ROW_H = 18;
+              private static final int PAD = 12;
+
+              private float open;
+              private float scroll;
+              private float scrollTarget;
+              private long lastNanos;
+              private String status = "";
+
+              private EditBox pathBox;
+              private Button btnSave;
+              private Button btnDefault;
+              private Button btnPrev;
+              private Button btnPlayPause;
+              private Button btnNext;
+              private Button btnStop;
+
+              private int panelX, panelY, panelW, panelH, listTop, listBottom;
+
+              public MusicScreen() {
+                  super(Component.literal("Music Player"));
+              }
+
+              @Override
+              protected void init() {
+                  panelW = Math.min(380, width - 20);
+                  panelH = height - 40;
+                  panelX = (width - panelW) / 2;
+                  panelY = 20;
+                  listTop = panelY + 96;
+                  listBottom = panelY + panelH - 50;
+
+                  int x = panelX + PAD;
+                  int innerW = panelW - PAD * 2;
+
+                  pathBox = addRenderableWidget(new EditBox(font, x, panelY + 46, innerW - 64, 18, Component.literal("Folder")));
+                  pathBox.setMaxLength(512);
+                  pathBox.setValue(MusicConfig.activeDir().toString());
+
+                  btnSave = addRenderableWidget(Button.builder(Component.literal("Simpan"), b -> applyPath())
+                          .bounds(x + innerW - 60, panelY + 46, 60, 18).build());
+
+                  btnDefault = addRenderableWidget(Button.builder(Component.literal("Bawaan"), b -> resetDefault())
+                          .bounds(x, panelY + 68, 70, 16).build());
+
+                  int cy = panelY + panelH - 36;
+                  btnPrev = addRenderableWidget(Button.builder(Component.literal("<<"), b -> MusicManager.prev())
+                          .bounds(x, cy, 60, 18).build());
+                  btnPlayPause = addRenderableWidget(Button.builder(Component.literal("Putar"), b -> MusicManager.resumeOrPlay())
+                          .bounds(x + 64, cy, 60, 18).build());
+                  btnNext = addRenderableWidget(Button.builder(Component.literal(">>"), b -> MusicManager.next())
+                          .bounds(x + 128, cy, 60, 18).build());
+                  btnStop = addRenderableWidget(Button.builder(Component.literal("Stop"), b -> MusicManager.stop())
+                          .bounds(x + 192, cy, 60, 18).build());
+              }
+
+              private void applyPath() {
+                  String value = pathBox.getValue().trim();
+                  if (value.isEmpty()) {
+                      status = "Path kosong";
+                      return;
+                  }
+                  Path p;
+                  try {
+                      p = Path.of(value);
+                  } catch (Exception e) {
+                      status = "Path tidak valid";
+                      return;
+                  }
+                  if (!Files.isDirectory(p)) {
+                      status = "Folder tidak ditemukan";
+                      return;
+                  }
+                  MusicConfig.setCustomDir(value);
+                  MusicManager.reload();
+                  status = "Folder diperbarui";
+              }
+
+              private void resetDefault() {
+                  MusicConfig.setCustomDir("");
+                  pathBox.setValue(MusicConfig.activeDir().toString());
+                  MusicManager.reload();
+                  status = "Pakai folder bawaan";
+              }
+
+              @Override
+              public void render(GuiGraphics g, int mx, int my, float partialTick) {
+                  long now = System.nanoTime();
+                  float dt = lastNanos == 0 ? 0f : Math.min(0.1f, (now - lastNanos) / 1_000_000_000f);
+                  lastNanos = now;
+
+                  open = Math.min(1f, open + dt * 3.5f);
+                  float e = easeOutCubic(open);
+                  scroll += (scrollTarget - scroll) * Math.min(1f, dt * 12f);
+
+                  // background hitam yang fade-in
+                  g.fill(0, 0, width, height, ((int) (0xE8 * e)) << 24);
+
+                  // panel
+                  int panelAlpha = ((int) (0xF2 * e)) << 24;
+                  g.fill(panelX, panelY, panelX + panelW, panelY + panelH, panelAlpha | (PANEL & 0x00FFFFFF));
+                  drawBorder(g, panelX, panelY, panelW, panelH, 0x8033FF77);
+                  g.fill(panelX, panelY, panelX + panelW, panelY + 2, ACCENT);
+
+                  // judul dengan denyut
+                  int titleAlpha = (int) (0x80 + 0x7F * Math.sin(now / 350_000_000d));
+                  g.drawString(font, "MUSIC PLAYER", panelX + PAD, panelY + 10, (titleAlpha << 24) | ACCENT_RGB);
+
+                  // equalizer animasi
+                  boolean active = MusicManager.isPlaying() && !MusicManager.isPaused();
+                  int bx0 = panelX + panelW - PAD - 5 * 6;
+                  for (int i = 0; i < 5; i++) {
+                      float h = active
+                              ? (float) (Math.abs(Math.sin(now / 220_000_000d + i * 1.1)) * 12 + 2)
+                              : 2f;
+                      int bx = bx0 + i * 6;
+                      g.fill(bx, panelY + 22 - (int) h, bx + 4, panelY + 22, ACCENT);
+                  }
+
+                  int textW = panelW - PAD * 2;
+                  String now_ = font.plainSubstrByWidth("Sekarang: " + MusicManager.nowPlaying(), textW);
+                  g.drawString(font, now_, panelX + PAD, panelY + 28, TEXT);
+                  g.drawString(font, "Folder musik:", panelX + PAD, panelY + 36, MUTED);
+
+                  // status
+                  if (!status.isEmpty()) {
+                      g.drawString(font, status, panelX + PAD + 76, panelY + 71, MUTED);
+                  }
+
+                  // pemisah
+                  g.fill(panelX + PAD, listTop - 8, panelX + panelW - PAD, listTop - 7, 0x3333FF77);
+
+                  // daftar lagu
+                  List<Path> tracks = MusicManager.tracks();
+                  int cur = MusicManager.currentIndex();
+                  int viewH = listBottom - listTop;
+                  float maxScroll = Math.max(0, tracks.size() * ROW_H - viewH);
+                  scrollTarget = clamp(scrollTarget, 0, maxScroll);
+                  scroll = clamp(scroll, 0, maxScroll);
+
+                  g.drawString(font, "Playlist (" + tracks.size() + " lagu)", panelX + PAD, listTop - 20, MUTED);
+
+                  if (tracks.isEmpty()) {
+                      g.drawString(font, "Tidak ada file .mp3 / .ogg di folder ini", panelX + PAD, listTop + 4, MUTED);
+                  }
+
+                  g.enableScissor(panelX, listTop, panelX + panelW, listBottom);
+                  for (int i = 0; i < tracks.size(); i++) {
+                      int y = listTop + i * ROW_H - (int) scroll;
+                      if (y + ROW_H < listTop || y > listBottom) continue;
+
+                      float rowT = clamp(open * 1.6f - i * 0.05f, 0f, 1f);
+                      int slideX = (int) ((1f - easeOutCubic(rowT)) * 40f);
+                      int rx = panelX + PAD + slideX;
+                      int rw = panelW - PAD * 2;
+
+                      boolean hover = mx >= panelX + PAD && mx < panelX + panelW - PAD
+                              && my >= y && my < y + ROW_H
+                              && my >= listTop && my < listBottom;
+
+                      if (i == cur) {
+                          g.fill(rx, y, rx + rw, y + ROW_H - 2, 0x3333FF77);
+                      } else if (hover) {
+                          g.fill(rx, y, rx + rw, y + ROW_H - 2, 0x1AFFFFFF);
+                      }
+
+                      String name = tracks.get(i).getFileName().toString();
+                      name = font.plainSubstrByWidth(name, rw - 14);
+                      int color = i == cur ? ACCENT : (hover ? 0xFFFFFFFF : TEXT);
+                      g.drawString(font, (i == cur ? "> " : "") + name, rx + 6, y + 5, color);
+                  }
+                  g.disableScissor();
+
+                  // scrollbar
+                  if (maxScroll > 0) {
+                      int sbH = Math.max(16, (int) (viewH * (float) viewH / (tracks.size() * ROW_H)));
+                      int sbY = listTop + (int) ((viewH - sbH) * (scroll / maxScroll));
+                      g.fill(panelX + panelW - 6, sbY, panelX + panelW - 4, sbY + sbH, ACCENT_DIM);
+                  }
+
+                  // hint
+                  g.drawString(font, "M / Esc untuk tutup", panelX + PAD, panelY + panelH - 14, MUTED);
+
+                  // widget
+                  btnPlayPause.setMessage(Component.literal(active ? "Jeda" : "Putar"));
+                  pathBox.render(g, mx, my, partialTick);
+                  btnSave.render(g, mx, my, partialTick);
+                  btnDefault.render(g, mx, my, partialTick);
+                  btnPrev.render(g, mx, my, partialTick);
+                  btnPlayPause.render(g, mx, my, partialTick);
+                  btnNext.render(g, mx, my, partialTick);
+                  btnStop.render(g, mx, my, partialTick);
+              }
+
+              @Override
+              public boolean mouseClicked(double mx, double my, int button) {
+                  if (super.mouseClicked(mx, my, button)) return true;
+                  if (button == 0
+                          && mx >= panelX + PAD && mx < panelX + panelW - PAD
+                          && my >= listTop && my < listBottom) {
+                      int idx = (int) ((my - listTop + (int) scroll) / ROW_H);
+                      if (idx >= 0 && idx < MusicManager.tracks().size()) {
+                          MusicManager.play(idx);
+                          return true;
+                      }
+                  }
+                  return false;
+              }
+
+              @Override
+              public boolean mouseScrolled(double mx, double my, double scrollX, double scrollY) {
+                  scrollTarget -= (float) scrollY * ROW_H;
+                  return true;
+              }
+
+              @Override
+              public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+                  if (keyCode == GLFW.GLFW_KEY_M && !pathBox.isFocused()) {
+                      onClose();
+                      return true;
+                  }
+                  return super.keyPressed(keyCode, scanCode, modifiers);
+              }
+
+              @Override
+              public boolean isPauseScreen() {
+                  return false;
+              }
+
+              private static float easeOutCubic(float t) {
+                  float inv = 1f - t;
+                  return 1f - inv * inv * inv;
+              }
+
+              private static float clamp(float v, float lo, float hi) {
+                  return Math.max(lo, Math.min(hi, v));
+              }
+
+              private static void drawBorder(GuiGraphics g, int x, int y, int w, int h, int c) {
+                  g.fill(x, y, x + w, y + 1, c);
+                  g.fill(x, y + h - 1, x + w, y + h, c);
+                  g.fill(x, y, x + 1, y + h, c);
+                  g.fill(x + w - 1, y, x + w, y + h, c);
+              }
+          }
+          EOF
+
+      - name: Build jar
+        run: gradle build --no-daemon
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: musicplayer
+          path: build/libs/*.jar
